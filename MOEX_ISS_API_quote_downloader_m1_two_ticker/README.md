@@ -1,7 +1,9 @@
-# Минутные свечи двух ближайших фьючерсов RTS и MIX
+# Минутные свечи двух ближайших фьючерсов выбранных активов
 
 `update_futures_m1_two_ticker.py` загружает по два ближайших к экспирации
-контракта каждого актива: две серии RTS и две серии MIX. За основу взяты
+контракта каждого указанного базового актива ISS. По умолчанию это RTS и MIX;
+через `--assets` можно передать другие коды без изменения скрипта.
+За основу взяты
 выбор исторической пары, SQLite и докачка из
 `C:\Users\Alkor\VSCode\quote_download\MOEX_ISS_API_quote_downloader_day2`.
 Используется стандартная библиотека Python 3.10+, сторонние пакеты не нужны.
@@ -14,7 +16,7 @@
 .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py
 ```
 
-По умолчанию загружаются оба актива с **2026-09-01 по вчерашнюю московскую
+По умолчанию загружаются RTS и MIX с **2026-09-01 по вчерашнюю московскую
 дату включительно**. Начало соответствует константе `FIRST_DATE` в коде
 загрузчика-образца; его README упоминает другую дату. Более ранний период
 можно задать через `--start`; доступность конкретных свечей зависит от ISS.
@@ -27,6 +29,11 @@
 | RTS | RI… | `C:\data_quote\m1_two_ticker\RTS_m1_two_ticker.db` |
 | MIX | MX… | `C:\data_quote\m1_two_ticker\MIX_m1_two_ticker.db` |
 
+Для остальных активов файл называется `<ASSET>_m1_two_ticker.db`, где
+`ASSET` — переданный код в верхнем регистре. Например, `BR` создаёт
+`C:\data_quote\m1_two_ticker\BR_m1_two_ticker.db`, а `Si` или `si` —
+`C:\data_quote\m1_two_ticker\SI_m1_two_ticker.db`.
+
 Другие варианты запуска:
 
 ```powershell
@@ -36,6 +43,15 @@
 # Только RTS или только MIX
 .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --assets RTS
 .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --assets MIX
+
+# RTS и MIX вместе с дополнительными BR и Si
+.\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --assets RTS MIX BR Si
+
+# Только BR и Si за указанный период
+.\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --assets BR Si --start 2026-09-01 --end 2026-09-30
+
+# Другой базовый актив без изменения кода загрузчика
+.\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --assets GOLD
 
 # Параметры сети и папка баз
 .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --data-dir C:\data_quote\m1_two_ticker --timeout 30 --retries 5 --pause 0.1
@@ -54,13 +70,30 @@
 |---|---|---|
 | `--start` | Первая календарная дата, `ГГГГ-ММ-ДД`, включительно | `2026-09-01` |
 | `--end` | Последняя календарная дата включительно, не позже вчера по Москве | Вчера по Москве |
-| `--assets` | Один или оба базовых актива: `RTS MIX` | Оба |
+| `--assets` | Один или несколько кодов базовых активов ISS, например `RTS MIX BR Si GOLD` | `RTS MIX` |
 | `--data-dir` | Папка отдельных SQLite-баз | `C:\data_quote\m1_two_ticker` |
 | `--timeout` | Положительный тайм-аут запроса, секунд | `20` |
 | `--retries` | Число попыток запроса, включая первую | `4` |
 | `--pause` | Пауза после успешного запроса, секунд | `0.05` |
 | `--recheck` | Заново запросить все даты периода | Выключен |
 | `--recheck-empty-weekends` | Заново запросить подтверждённые пустые выходные | Выключен |
+
+`--assets` задаёт полный набор для текущего запуска: `--assets BR Si`
+загружает только BR и Si. Чтобы сохранить RTS и MIX в этом запуске,
+перечислите их явно: `--assets RTS MIX BR Si`.
+
+Количество активов не ограничено списком в коде. Передавайте именно
+`ASSETCODE` базового актива в ISS, а не `SECID` контракта вроде `SiZ6`
+или краткое название `Si-12.26`. Регистр кода не важен; повторы удаляются
+с сохранением порядка первого появления. Полные `SECID` из ответов ISS
+сохраняют исходный регистр.
+
+Допустим код длиной от 1 до 64 символов, начинающийся с латинской буквы
+и содержащий латинские буквы, цифры, `_` или `-`. Пробелы, точки и символы
+пути отклоняются до открытия баз. Код должен существовать в ISS и иметь
+не менее двух действующих фьючерсных серий на RFUD в нужные даты;
+при отсутствии подходящей пары загрузчик сообщает об ошибке. Для другого
+инструмента сохраняются те же проверки свечей и правила докачки.
 
 ## Логика загрузки
 
@@ -173,10 +206,10 @@
 ISS для RTS и MIX завершились тайм-аутом до получения истории. Котировки
 при этом не были загружены. При доступном ISS повторите обычную команду.
 
-Автоматические проверки из корня проекта:
+Автоматические проверки загрузчика из корня проекта:
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -p test_m1_downloader.py -v
 ```
 
 Тесты находятся в `tests` и используют искусственные ответы ISS, не сеть.

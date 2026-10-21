@@ -1,4 +1,9 @@
-r"""Загрузка минутных свечей двух ближайших фьючерсов каждого актива RTS и MIX.
+r"""Загрузка минутных свечей двух ближайших фьючерсов каждого выбранного актива ISS.
+
+--assets принимает любое число кодов базовых активов ISS: RTS, MIX, BR, Si,
+GOLD и другие. По умолчанию выбраны RTS и MIX. Коды приводятся к верхнему
+регистру, повторения исключаются. Указываются базовые активы, а не SECID
+конкретных контрактов; существование кода проверяется по данным ISS.
 
 За каждую календарную дату читаются все страницы дневной истории MOEX ISS.
 Если истории нет, состав контрактов ищется в предыдущие 14 календарных дней,
@@ -10,7 +15,8 @@ r"""Загрузка минутных свечей двух ближайших �
 Архивные SECID сохраняются целиком. Свечи без сделок не создаются искусственно.
 Две серии и контрольные суммы их свечей записываются одной транзакцией SQLite.
 
-Базы: C:\data_quote\m1_two_ticker\RTS_m1_two_ticker.db и MIX_m1_two_ticker.db.
+База каждого актива: C:\data_quote\m1_two_ticker\<ASSET>_m1_two_ticker.db;
+например, RTS_m1_two_ticker.db, BR_m1_two_ticker.db и SI_m1_two_ticker.db.
 По умолчанию период начинается 2026-09-01 и заканчивается вчера по Москве.
 Повторный запуск проверяет весь период: целые дни пропускаются, пропуски
 и изменённые данные загружаются вновь. Пустые выходные кешируются только после
@@ -25,6 +31,9 @@ r"""Загрузка минутных свечей двух ближайших �
     .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --start 2020-01-01
     .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --start 2026-09-01 --end 2026-09-30
     .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --assets RTS --timeout 30 --retries 5
+    .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --assets RTS MIX BR Si
+    .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --assets BR Si --start 2026-09-01 --end 2026-09-30
+    .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --assets GOLD
     .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --data-dir C:\data_quote\m1_two_ticker --recheck
     .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --recheck-empty-weekends
     .\.venv\Scripts\python.exe MOEX_ISS_API_quote_downloader_m1_two_ticker\update_futures_m1_two_ticker.py --help
@@ -37,6 +46,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import sqlite3
 import time
 from contextlib import closing
@@ -90,8 +100,17 @@ def yesterday_moscow(now: datetime | None = None) -> date:
     return instant.astimezone(MOSCOW).date() - timedelta(days=1)
 
 
+def parse_asset_code(value: str) -> str:
+    """Проверяет код базового актива value и возвращает верхний регистр; при неверном формате выдаёт ошибку аргумента."""
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", value):
+        raise argparse.ArgumentTypeError(
+            "Нужен код базового актива ISS: от 1 до 64 латинских букв, цифр, '_' или '-', "
+            "начиная с буквы, например RTS, BR или Si. Пути и названия вроде Si-12.26 не подходят.")
+    return value.upper()
+
+
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
-    """Проверяет параметры argv или командной строки и возвращает настройки загрузки."""
+    """Проверяет argv или командную строку и возвращает настройки с уникальными кодами активов в верхнем регистре."""
     parser = argparse.ArgumentParser(description=__doc__, add_help=False,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-h", "--help", action="help", help="Показать справку и завершить работу.")
@@ -99,10 +118,11 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Первая календарная дата включительно (2026-09-01).")
     parser.add_argument("--end", type=date.fromisoformat, default=yesterday_moscow(),
                         help="Последняя дата включительно (вчера по Москве).")
-    parser.add_argument("--assets", nargs="+", choices=("RTS", "MIX"), default=["RTS", "MIX"],
-                        help="Базовые активы ISS (по умолчанию RTS MIX).")
+    parser.add_argument("--assets", nargs="+", type=parse_asset_code, metavar="ASSET", default=["RTS", "MIX"],
+                        help="Любые коды базовых активов ISS, например RTS MIX BR Si GOLD; "
+                             "регистр не важен, повторы исключаются (по умолчанию RTS MIX).")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
-                        help=f"Папка двух SQLite-баз ({DEFAULT_DATA_DIR}).")
+                        help=f"Папка отдельных SQLite-баз выбранных активов ({DEFAULT_DATA_DIR}).")
     parser.add_argument("--timeout", type=float, default=20, help="Тайм-аут запроса в секундах (20).")
     parser.add_argument("--retries", type=int, default=4, help="Число попыток запроса, включая первую (4).")
     parser.add_argument("--pause", type=float, default=0.05, help="Пауза после успешного запроса, секунд (0.05).")
@@ -256,7 +276,7 @@ class ISSClient:
                 raise ISSRequestError(f"{error} URL: {url}; ответ: {json.dumps(payload, ensure_ascii=False)}") from error
 
     def history(self, asset: str, day: date) -> list[dict[str, Any]]:
-        """Возвращает отдельные контракты asset на RFUD за day, исключая спреды после чтения всех страниц."""
+        """Возвращает контракты asset на RFUD за day, сравнивая код актива без учёта регистра и исключая спреды после всех страниц."""
         rows = self.all_rows(HISTORY_PATH, {
             "date": day.isoformat(), "assetcode": asset, "iss.only": "history,history.cursor",
             "history.columns": ",".join(HISTORY_COLUMNS),
@@ -265,7 +285,7 @@ class ISSClient:
             if (any(not isinstance(row[key], str) or not row[key].strip()
                     for key in ("SECID", "BOARDID", "TRADEDATE")) or row["TRADEDATE"] != day.isoformat()):
                 raise ISSRequestError(f"{asset} {day}: неверные идентификаторы истории: {row!r}")
-        contract_assets = {row["SECID"]: row["ASSETCODE"] for row in rows
+        contract_assets = {row["SECID"]: row["ASSETCODE"].strip().upper() for row in rows
                            if row["BOARDID"] == "RFUD" and isinstance(row["ASSETCODE"], str) and row["ASSETCODE"]}
         filtered = []
         for row in rows:
@@ -280,7 +300,7 @@ class ISSClient:
                 continue
             if not isinstance(row["ASSETCODE"], str) or not row["ASSETCODE"].strip():
                 raise ISSRequestError(f"{asset} {day}: неверный ASSETCODE: {row!r}")
-            if row["ASSETCODE"] == asset:
+            if row["ASSETCODE"].strip().upper() == asset.upper():
                 trades = row["NUMTRADES"]
                 if (isinstance(trades, bool) or not isinstance(trades, (int, float))
                         or not math.isfinite(trades) or trades < 0 or int(trades) != trades):
@@ -289,10 +309,12 @@ class ISSClient:
         return filtered
 
     def contract(self, asset: str, secid: str) -> dict[str, str]:
-        """Получает реальные SHORTNAME и LSTTRADE полного secid и проверяет принадлежность asset."""
+        """Получает SHORTNAME и LSTTRADE полного secid и проверяет принадлежность asset без учёта регистра кода актива."""
         payload = self.get_json(f"/securities/{quote(secid, safe='')}.json", {"iss.only": "description"})
         description = {row["name"]: row["value"] for row in table_rows(payload, "description", ("name", "value"))}
-        if description.get("ASSETCODE") not in (None, asset):
+        description_asset = description.get("ASSETCODE")
+        if description_asset is not None and (not isinstance(description_asset, str)
+                                               or description_asset.strip().upper() != asset.upper()):
             raise DataError(f"{secid}: другой базовый актив в описании.")
         shortname, expiry = description.get("SHORTNAME"), description.get("LSTTRADE")
         if not isinstance(shortname, str) or not shortname.strip():

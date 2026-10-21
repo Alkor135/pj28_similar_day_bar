@@ -1,4 +1,4 @@
-"""Проверки выбора контрактов, пагинации и атомарной докачки минутных свечей.
+"""Проверки выбора контрактов, пагинации и докачки минутных свечей разных активов.
 
 Тесты используют искусственные ответы ISS и временные SQLite-базы внутри tests.
 Сеть и рабочие базы C:\\data_quote не используются.
@@ -52,7 +52,7 @@ class FixtureClient:
 
     def __init__(self, asset: str = "RTS", empty_second: bool = False):
         """Готовит три контракта актива asset; empty_second убирает сделки второго контракта."""
-        prefix = "RI" if asset == "RTS" else "MX"
+        prefix = {"RTS": "RI", "MIX": "MX", "BR": "BR", "SI": "Si", "GOLD": "GD"}[asset]
         self.secids = [prefix + code for code in ("U6", "Z6", "H7")]
         self.rows = [history(secid, asset, 0 if empty_second and index == 1 else 1)
                      for index, secid in enumerate(self.secids)]
@@ -185,6 +185,22 @@ class PaginationTests(unittest.TestCase):
                                                           table("history", [], list(row))]):
             with self.assertRaises(source.ISSRequestError):
                 client.history("RTS", DAY)
+
+    def test_asset_case_in_history_and_description_does_not_drop_contract(self):
+        """Код Si в ответах ISS должен соответствовать активу SI командной строки без изменения SECID."""
+        row = history("SiU6", "Si")
+        client = source.ISSClient(pause=0)
+        pages = [table("history", [row]), table("history", [], list(row))]
+        with patch.object(client, "get_json", side_effect=pages) as get_json:
+            self.assertEqual(client.history("SI", DAY), [row])
+            self.assertEqual(get_json.call_args_list[0].args[1]["assetcode"], "SI")
+        description = table("description", [
+            {"name": "ASSETCODE", "value": "Si"},
+            {"name": "SHORTNAME", "value": "Si-9.26"},
+            {"name": "LSTTRADE", "value": "2026-09-17"},
+        ])
+        with patch.object(client, "get_json", return_value=description):
+            self.assertEqual(client.contract("SI", "SiU6")["SECID"], "SiU6")
 
 
 class DatabaseTests(unittest.TestCase):
@@ -320,7 +336,37 @@ class DatabaseTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
-    """Проверяет параметры, московскую дату, журналы и запуск двух активов."""
+    """Проверяет параметры, московскую дату, журналы и запуск произвольного набора активов."""
+
+    def test_assets_accept_additional_codes_and_ignore_case_and_duplicates(self):
+        """Новые активы разрешены, повторные коды и разный регистр не создают дубли баз."""
+        args = source.parse_arguments(["--assets", "rts", "MiX", "BR", "Si", "gold", "SI", "br"])
+        self.assertEqual(args.assets, ["RTS", "MIX", "BR", "SI", "GOLD"])
+        self.assertEqual(source.parse_arguments([]).assets, ["RTS", "MIX"])
+
+    def test_asset_codes_reject_path_characters_and_contract_names(self):
+        """Вместо кода актива нельзя передать путь, пробелы или название конкретного контракта с точкой."""
+        for value in ("../BR", "BR/other", "BR\\other", "Si-12.26", "Si Z6", "", "_", "BR:"):
+            with self.subTest(value=value), patch("sys.stderr", new_callable=io.StringIO):
+                with self.assertRaises(SystemExit):
+                    source.parse_arguments(["--assets", value])
+
+    def test_main_saves_separate_databases_for_additional_assets(self):
+        """BR, Si и GOLD проходят полный цикл загрузки пары и получают собственные базы с метаданными."""
+        assets = ("BR", "SI", "GOLD")
+        with tempfile.TemporaryDirectory(dir=ROOT / "tests") as temporary:
+            args = ["--data-dir", temporary, "--assets", "BR", "Si", "GOLD",
+                    "--start", DAY.isoformat(), "--end", DAY.isoformat()]
+            with patch.object(source, "ISSClient", side_effect=[FixtureClient(asset) for asset in assets]), \
+                    patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(source.main(args), 0)
+            self.assertEqual({path.name for path in Path(temporary).iterdir()},
+                             {f"{asset}_m1_two_ticker.db" for asset in assets})
+            for asset in assets:
+                with closing(sqlite3.connect(Path(temporary) / f"{asset}_m1_two_ticker.db")) as connection:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM Minute").fetchone(), (2,))
+                    self.assertEqual(connection.execute("SELECT VALUE FROM Metadata WHERE KEY='ASSETCODE'").fetchone(),
+                                     (asset,))
 
     def test_moscow_yesterday_and_current_day_rejected(self):
         """Граница даты учитывает UTC+3, а явная текущая дата запрещена."""
