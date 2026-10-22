@@ -1,0 +1,210 @@
+<!doctype html>
+<!--
+Назначение: автономный отчёт о накопленном PnL, просадке и показателях похожих баров.
+Генератор build_pnl_report.py встраивает проверенные данные и таблицу, браузер
+строит SVG без внешних библиотек и сетевых запросов. Между барами PnL постоянен.
+Подсказка и её направляющая одновременно относятся только к одному графику.
+Пример создания из корня проекта:
+  .\.venv\Scripts\python.exe similar_bars\build_pnl_report.py --assets RTS MIX
+Открывайте созданный pnl_report.html, а не этот шаблон с плейсхолдерами.
+-->
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'">
+  <title>@@REPORT_TITLE@@</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #fff; --fg: #18222d; --muted: #536476; --border: #dbe2ea; --blue: #1977d5; --orange: #d96a18; --tip: #f7f9fc; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #161a20; --fg: #e5edf6; --muted: #aab6c5; --border: #36414e; --blue: #64acfa; --orange: #ffad68; --tip: #202833; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+    main { max-width: 1160px; margin: 0 auto; padding: 24px; position: relative; }
+    h1 { font-size: 24px; font-weight: 600; margin: 0 0 8px; }
+    .parameters, .note { color: var(--muted); font-size: 13px; }
+    .parameters { margin: 12px 0; }
+    .legend { display: flex; gap: 24px; margin: 12px 0 4px; flex-wrap: wrap; }
+    .legend button { color: var(--fg); background: transparent; border: 0; padding: 8px 0; font: inherit; display: flex; gap: 9px; align-items: center; cursor: pointer; }
+    .legend button[aria-pressed="false"] { opacity: .4; }
+    .swatch { width: 23px; border-top: 2px solid var(--blue); }
+    .swatch.mix { border-top-color: var(--orange); border-top-style: dashed; }
+    .chart { display: block; width: 100%; }
+    .chart text { font: 12px system-ui, sans-serif; fill: var(--fg); }
+    .table-wrapper { margin: 18px 0; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    td, th { padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: top; text-align: left; }
+    tbody th { font-weight: 400; width: 48%; }
+    thead th { font-weight: 600; }
+    .numeric { text-align: right; font-variant-numeric: tabular-nums; }
+    .tooltip { position: absolute; z-index: 2; pointer-events: none; background: var(--tip); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; font-variant-numeric: tabular-nums; }
+    .tooltip[hidden] { display: none; }
+    .tip-row { display: flex; justify-content: space-between; gap: 24px; }
+    footer { color: var(--muted); font-size: 13px; margin-top: 20px; }
+    @media (max-width: 500px) { main { padding: 16px 10px; } h1 { font-size: 21px; } td, th { padding: 9px 5px; } }
+    @media (pointer: coarse) { .legend button { min-height: 44px; } }
+    @media print { .tooltip { display: none; } main { max-width: none; padding: 0; } .chart, table { break-inside: avoid; } }
+  </style>
+</head>
+<body>
+<main id="pnl-report">
+  <h1>@@REPORT_TITLE@@</h1>
+  <div class="note">Без комиссий и проскальзывания. Результаты в пунктах котировки каждого инструмента.</div>
+  <div class="parameters">@@REPORT_PARAMETERS@@</div>
+  <div class="legend" aria-label="Видимость линий">@@REPORT_LEGEND@@</div>
+  <svg id="pnl-chart" class="chart" role="img" aria-label="Накопленный PnL по датам закрытия целевых баров"></svg>
+  <svg id="drawdown-chart" class="chart" role="img" aria-label="Просадка от достигнутого максимума по закрытиям баров"></svg>
+  <div class="tooltip" role="tooltip" hidden></div>
+  <noscript>Для просмотра графиков включите JavaScript. Все показатели доступны в таблице ниже.</noscript>
+  <div class="table-wrapper">
+    <table aria-label="Показатели проверки торговой идеи">
+      <thead><tr><th scope="col">Показатель</th>@@REPORT_HEADERS@@</tr></thead>
+      <tbody>@@REPORT_METRICS@@</tbody>
+    </table>
+  </div>
+  <footer>Веса указаны в порядке: тело / верхний фитиль / нижний фитиль / объём.
+    Точность исключает целевые бары с нулевым телом. Средний проигрыш — положительный модуль.
+    Прибыль-фактор — сумма выигрышей, делённая на сумму проигрышей; при отсутствии проигрышей — тире.
+    Просадка рассчитана по закрытиям баров от максимума накопленного PnL, включая начальный ноль.
+    Следующий бар после последнего сигнала может ещё отсутствовать: такой прогноз не включён в итог.
+    Отчёт содержит снимок результатов на момент генерации.</footer>
+  <script type="application/json" id="pnl-data">@@REPORT_DATA@@</script>
+  <script>
+  /* Назначение: построить графики из встроенного снимка без сети и зависимостей.
+     Параметры: данные pnl-data; результат: SVG и подсказки по датам.
+     Пример использования: открыть созданный HTML и навести указатель либо коснуться графика. */
+  (() => {
+    const root = document.getElementById('pnl-report');
+    const data = JSON.parse(document.getElementById('pnl-data').textContent);
+    const assets = Object.keys(data);
+    const visible = new Set(assets);
+    const tooltip = root.querySelector('.tooltip');
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const integer = new Intl.NumberFormat('ru-RU', {maximumFractionDigits: 2});
+    const dateFormat = new Intl.DateTimeFormat('ru-RU', {timeZone: 'UTC'});
+    const color = {RTS: 'var(--blue)', MIX: 'var(--orange)'};
+    const observations = Object.fromEntries(assets.map(asset => [asset, data[asset].points.map(point => [Date.parse(point[0]+'T00:00:00Z'), point[1], point[2]])]));
+    let pinned = false;
+    let activeHover = null;
+
+    /** Добавляет SVG-элемент tag с attributes и необязательным text в parent; возвращает элемент. */
+    function element(parent, tag, attributes, text) {
+      const node = document.createElementNS(svgNS, tag);
+      Object.entries(attributes).forEach(([key, value]) => node.setAttribute(key, value));
+      if (text !== undefined) node.textContent = text;
+      parent.appendChild(node); return node;
+    }
+
+    /** Возвращает удобный шаг делений для числового диапазона range и желаемого count. */
+    function tickStep(range, count) {
+      const raw = range/count;
+      const power = 10 ** Math.floor(Math.log10(raw));
+      const fraction = raw/power;
+      return (fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10)*power;
+    }
+
+    /** Находит последнее известное наблюдение points на момент time двоичным поиском; возвращает строку. */
+    function observationAt(points, time) {
+      let left = 0, right = points.length;
+      while (left < right) { const middle = (left+right) >>> 1; if (points[middle][0] <= time) left=middle+1; else right=middle; }
+      return points[Math.max(0, left-1)];
+    }
+
+    /** Рисует график svg по полю index с подписью label и высотой height; результата нет. */
+    function drawPlot(svg, index, label, height) {
+      svg.replaceChildren();
+      const width = Math.max(280, svg.getBoundingClientRect().width);
+      svg.setAttribute('viewBox', `0 0 ${width} ${height}`); svg.setAttribute('height', height);
+      const bounds = {left: 86, right: width-12, top: 28, bottom: height-49};
+      const all = assets.flatMap(asset => observations[asset]);
+      const dates = all.map(point=>point[0]);
+      const first = Math.min(...dates), last = Math.max(...dates);
+      const span = last-first || 86400000;
+      const xMin=first-span*.005, xMax=(last===first ? first+span : last)+span*.005;
+      const values = all.map(point=>index===2 ? -point[2] : point[1]);
+      const minimum=Math.min(0,...values), maximum=Math.max(0,...values);
+      const padding=(maximum-minimum || 1)*.08;
+      const step=tickStep(maximum-minimum+2*padding, index===2 ? 3 : 5);
+      const yMin=Math.floor((minimum-padding)/step)*step, yMax=Math.ceil((maximum+padding)/step)*step;
+
+      /** Переводит момент time в координату X текущего графика; возвращает число пикселей. */
+      function x(time) { return bounds.left+2+(time-xMin)/(xMax-xMin)*(bounds.right-bounds.left-4); }
+      /** Переводит числовой результат value в координату Y текущего графика; возвращает число пикселей. */
+      function y(value) { return bounds.bottom-2-(value-yMin)/(yMax-yMin)*(bounds.bottom-bounds.top-4); }
+      /** Возвращает значение выбранной метрики из наблюдения point. */
+      function value(point) { return index===2 ? -point[2] : point[1]; }
+
+      element(svg,'title',{},label);
+      for (let tick=yMin; tick<=yMax+step*.001; tick+=step) {
+        element(svg,'line',{x1:bounds.left,x2:bounds.right,y1:y(tick),y2:y(tick),stroke:'var(--border)','stroke-opacity':.6});
+        element(svg,'text',{x:bounds.left-8,y:y(tick)+4,'text-anchor':'end'},integer.format(Math.abs(tick)<step*.001 ? 0 : tick));
+      }
+      element(svg,'rect',{'data-chart-frame':'',x:bounds.left,y:bounds.top,width:bounds.right-bounds.left,height:bounds.bottom-bounds.top,fill:'none',stroke:'var(--border)'});
+      element(svg,'line',{x1:bounds.left,x2:bounds.right,y1:y(0),y2:y(0),stroke:'var(--fg)','stroke-opacity':.35});
+      const count=width<500 ? 3 : 6;
+      const tickFormat=new Intl.DateTimeFormat('ru-RU',{timeZone:'UTC',year:'numeric',month:span<86400000*730?'2-digit':undefined,day:span<86400000*60?'2-digit':undefined});
+      for (let i=0;i<=count;i++) {
+        const time=first+(last-first)*i/count;
+        if (i>0 && first===last) continue;
+        element(svg,'text',{x:x(time),y:bounds.bottom+20,'text-anchor':i===0?'start':i===count?'end':'middle'},tickFormat.format(time));
+      }
+      element(svg,'text',{'data-axis':'y',x:bounds.left,y:16},label);
+      element(svg,'text',{'data-axis':'x',x:bounds.right,y:height-8,'text-anchor':'end'},'Дата закрытия целевого бара');
+      assets.filter(asset=>visible.has(asset)).forEach(asset=>{
+        const points=observations[asset];
+        const commands=points.map((point,i)=>i===0?`M ${x(point[0])} ${y(value(point))}`:`H ${x(point[0])} V ${y(value(point))}`).join(' ');
+        const attributes={d:commands,'data-series-path':asset,fill:'none',stroke:color[asset],'stroke-width':1.8};
+        if (asset==='MIX') attributes['stroke-dasharray']='7 4';
+        element(svg,'path',attributes);
+      });
+      const hover=element(svg,'g',{'pointer-events':'none',visibility:'hidden'});
+      const guide=element(hover,'line',{'data-hover-guide':'',y1:bounds.top,y2:bounds.bottom,stroke:'var(--fg)','stroke-opacity':.5});
+      const markers=Object.fromEntries(assets.filter(asset=>visible.has(asset)).map(asset=>[asset,element(hover,'circle',{r:3.5,fill:color[asset],stroke:'var(--bg)'})]));
+
+      /** Показывает значения события event, очищая направляющую другого графика; результата нет. */
+      function show(event) {
+        if (activeHover && activeHover !== hover) activeHover.setAttribute('visibility','hidden');
+        activeHover=hover;
+        const box=svg.getBoundingClientRect();
+        const cursor=Math.max(bounds.left+2,Math.min(bounds.right-2,event.clientX-box.left));
+        const time=xMin+(cursor-bounds.left-2)/(bounds.right-bounds.left-4)*(xMax-xMin);
+        hover.setAttribute('visibility','visible'); guide.setAttribute('x1',cursor); guide.setAttribute('x2',cursor);
+        tooltip.replaceChildren();
+        const heading=document.createElement('div'); heading.textContent=dateFormat.format(Math.max(first,Math.min(last,time))); tooltip.appendChild(heading);
+        assets.filter(asset=>visible.has(asset)).forEach(asset=>{
+          const point=observationAt(observations[asset],time);
+          markers[asset].setAttribute('cx',cursor); markers[asset].setAttribute('cy',y(value(point)));
+          const row=document.createElement('div'); row.className='tip-row';
+          const name=document.createElement('span'); name.textContent=asset;
+          const result=document.createElement('span'); result.textContent=integer.format(value(point))+' п.';
+          row.append(name,result); tooltip.appendChild(row);
+        });
+        tooltip.hidden=false;
+        const rootBox=root.getBoundingClientRect(), tipBox=tooltip.getBoundingClientRect();
+        tooltip.style.left=Math.max(0,Math.min(rootBox.width-tipBox.width,event.clientX-rootBox.left+14))+'px';
+        tooltip.style.top=Math.max(0,event.clientY-rootBox.top-tipBox.height-12)+'px';
+      }
+      const overlay=element(svg,'rect',{'data-chart-hit':'',x:bounds.left,y:bounds.top,width:bounds.right-bounds.left,height:bounds.bottom-bounds.top,fill:'transparent'});
+      overlay.addEventListener('pointermove',event=>{if(!pinned)show(event);});
+      overlay.addEventListener('pointerleave',()=>{if(!pinned){tooltip.hidden=true;hover.setAttribute('visibility','hidden');}});
+      overlay.addEventListener('click',event=>{pinned=!pinned;show(event);});
+    }
+
+    /** Перерисовывает графики PnL и просадки после изменения размера или видимых серий; параметров и результата нет. */
+    function drawAll() {
+      pinned=false;activeHover=null;tooltip.hidden=true;
+      drawPlot(document.getElementById('pnl-chart'),1,'PnL, пункты',340);
+      drawPlot(document.getElementById('drawdown-chart'),2,'Просадка, пункты',200);
+    }
+    root.querySelectorAll('[data-series]').forEach(button=>button.addEventListener('click',()=>{
+      const asset=button.dataset.series;
+      if(visible.has(asset)&&visible.size>1)visible.delete(asset);else visible.add(asset);
+      root.querySelectorAll('[data-series]').forEach(item=>item.setAttribute('aria-pressed',String(visible.has(item.dataset.series))));
+      drawAll();
+    }));
+    new ResizeObserver(drawAll).observe(root);
+    drawAll();
+  })();
+  </script>
+</main>
+</body>
+</html>
